@@ -1,0 +1,614 @@
+CILJ: Migracija persistencije sa JSON fajla (z.json) na Room bazu podataka,
+uz očuvanje svih postojećih podataka korisnika. Google Drive backup/restore
+ostaje funkcionalan (koristi JSON export/import).
+
+Aplikacija: Zaduženja - Android app za praćenje zaduženja radne opreme.
+Paket: com.zaduzenja.app
+Direktorijum: zaduzenja/android/
+
+=======================================================
+=== FAZA 1: Dodavanje Room i KSP zavisnosti ===
+=======================================================
+Opis: Dodavanje KSP plugina i Room biblioteke u Gradle konfiguraciju.
+Ovo je preduslov za sve ostale faze.
+
+Fajlovi koji se menjaju:
+- android/build.gradle.kts (root) — dodavanje KSP plugina
+- android/app/build.gradle.kts — dodavanje KSP plugina i Room zavisnosti
+
+Detalji:
+
+1. U ROOT build.gradle.kts (android/build.gradle.kts) dodaj KSP plugin:
+   Trenutni sadržaj:
+   ```
+   plugins {
+       id("com.android.application") version "8.7.3" apply false
+       id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+       id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+   }
+   ```
+   Dodaj red:
+   ```
+   id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+   ```
+
+2. U APP build.gradle.kts (android/app/build.gradle.kts):
+   a) U plugins bloku dodaj:
+      ```
+      id("com.google.devtools.ksp")
+      ```
+   b) U dependencies bloku dodaj:
+      ```
+      // Room
+      val roomVersion = "2.6.1"
+      implementation("androidx.room:room-runtime:$roomVersion")
+      implementation("androidx.room:room-ktx:$roomVersion")
+      ksp("androidx.room:room-compiler:$roomVersion")
+      ```
+
+NAPOMENA: Kotlin verzija je 2.0.21, KSP verzija mora da odgovara (2.0.21-1.0.28).
+Room 2.6.1 podržava KSP i radi sa ovom verzijom Kotlina.
+
+Rezultat faze: Projekat se kompajlira sa Room zavisnostima.
+
+=======================================================
+=== FAZA 2: Room entiteti, DAO i Database klasa ===
+=======================================================
+Opis: Kreiranje Room sloja — entiteti (tabele), DAO (upiti) i
+AppDatabase klasa. Bez menjanja postojeće logike.
+
+Kontekst projekta: Android app (com.zaduzenja.app) koja prati zaduženja
+radne opreme. Ima 5 tipova artikala (rukavice, maxicut, majica, cipele, odelo),
+svaki sa istorijom zaduženja. Trenutno koristi JSON fajl, migriramo na Room.
+
+Fajlovi koji se kreiraju:
+- android/app/src/main/java/com/zaduzenja/app/data/db/ArticleEntity.kt
+- android/app/src/main/java/com/zaduzenja/app/data/db/HistoryEntryEntity.kt
+- android/app/src/main/java/com/zaduzenja/app/data/db/ArticleDao.kt
+- android/app/src/main/java/com/zaduzenja/app/data/db/AppDatabase.kt
+
+Detalji:
+
+1. ArticleEntity.kt:
+   ```kotlin
+   package com.zaduzenja.app.data.db
+
+   import androidx.room.ColumnInfo
+   import androidx.room.Entity
+   import androidx.room.PrimaryKey
+
+   @Entity(tableName = "articles")
+   data class ArticleEntity(
+       @PrimaryKey
+       @ColumnInfo(name = "article_type")
+       val articleType: String,     // "rukavice", "maxicut", "majica", "cipele", "odelo"
+
+       @ColumnInfo(name = "last_assignment")
+       val lastAssignment: String?  // ISO format "yyyy-MM-dd" ili null
+   )
+   ```
+
+2. HistoryEntryEntity.kt:
+   ```kotlin
+   package com.zaduzenja.app.data.db
+
+   import androidx.room.ColumnInfo
+   import androidx.room.Entity
+   import androidx.room.ForeignKey
+   import androidx.room.Index
+   import androidx.room.PrimaryKey
+
+   @Entity(
+       tableName = "history_entries",
+       foreignKeys = [
+           ForeignKey(
+               entity = ArticleEntity::class,
+               parentColumns = ["article_type"],
+               childColumns = ["article_type"],
+               onDelete = ForeignKey.CASCADE
+           )
+       ],
+       indices = [Index(value = ["article_type"])]
+   )
+   data class HistoryEntryEntity(
+       @PrimaryKey(autoGenerate = true)
+       val id: Long = 0,
+
+       @ColumnInfo(name = "article_type")
+       val articleType: String,     // FK ka articles tabeli
+
+       @ColumnInfo(name = "date")
+       val date: String,            // ISO format "yyyy-MM-dd"
+
+       @ColumnInfo(name = "size")
+       val size: String? = null     // npr. "43", "XL", null
+   )
+   ```
+
+3. ArticleDao.kt:
+   ```kotlin
+   package com.zaduzenja.app.data.db
+
+   import androidx.room.Dao
+   import androidx.room.Insert
+   import androidx.room.OnConflictStrategy
+   import androidx.room.Query
+   import androidx.room.Transaction
+
+   @Dao
+   interface ArticleDao {
+
+       @Query("SELECT * FROM articles WHERE article_type = :type")
+       suspend fun getArticle(type: String): ArticleEntity?
+
+       @Query("SELECT * FROM articles")
+       suspend fun getAllArticles(): List<ArticleEntity>
+
+       @Insert(onConflict = OnConflictStrategy.REPLACE)
+       suspend fun insertArticle(article: ArticleEntity)
+
+       @Insert(onConflict = OnConflictStrategy.REPLACE)
+       suspend fun insertArticles(articles: List<ArticleEntity>)
+
+       @Query("UPDATE articles SET last_assignment = :lastAssignment WHERE article_type = :type")
+       suspend fun updateLastAssignment(type: String, lastAssignment: String?)
+
+       // History entries
+
+       @Query("SELECT * FROM history_entries WHERE article_type = :type ORDER BY date ASC")
+       suspend fun getHistory(type: String): List<HistoryEntryEntity>
+
+       @Query("SELECT * FROM history_entries ORDER BY date ASC")
+       suspend fun getAllHistory(): List<HistoryEntryEntity>
+
+       @Insert
+       suspend fun insertHistoryEntry(entry: HistoryEntryEntity): Long
+
+       @Insert
+       suspend fun insertHistoryEntries(entries: List<HistoryEntryEntity>)
+
+       @Query("DELETE FROM history_entries WHERE id = :id")
+       suspend fun deleteHistoryEntry(id: Long)
+
+       @Query("DELETE FROM history_entries WHERE article_type = :type AND date = :date AND (size = :size OR (size IS NULL AND :size IS NULL))")
+       suspend fun deleteHistoryEntryByContent(type: String, date: String, size: String?)
+
+       @Query("SELECT * FROM history_entries WHERE article_type = :type ORDER BY date DESC LIMIT 1")
+       suspend fun getLastHistoryEntry(type: String): HistoryEntryEntity?
+
+       // Za migraciju - provera da li baza već ima podatke
+       @Query("SELECT COUNT(*) FROM articles")
+       suspend fun getArticleCount(): Int
+   }
+   ```
+
+4. AppDatabase.kt:
+   ```kotlin
+   package com.zaduzenja.app.data.db
+
+   import android.content.Context
+   import androidx.room.Database
+   import androidx.room.Room
+   import androidx.room.RoomDatabase
+
+   @Database(
+       entities = [ArticleEntity::class, HistoryEntryEntity::class],
+       version = 1,
+       exportSchema = false
+   )
+   abstract class AppDatabase : RoomDatabase() {
+       abstract fun articleDao(): ArticleDao
+
+       companion object {
+           @Volatile
+           private var INSTANCE: AppDatabase? = null
+
+           fun getInstance(context: Context): AppDatabase {
+               return INSTANCE ?: synchronized(this) {
+                   INSTANCE ?: Room.databaseBuilder(
+                       context.applicationContext,
+                       AppDatabase::class.java,
+                       "zaduzenja.db"
+                   ).build().also { INSTANCE = it }
+               }
+           }
+       }
+   }
+   ```
+
+NAPOMENA: Svi datumi se čuvaju kao String u ISO formatu (yyyy-MM-dd).
+Nema TypeConvertera — konverzija LocalDate ↔ String se radi u DataRepository.
+
+Rezultat faze: Room sloj kreiran, ali se još ne koristi u aplikaciji.
+
+=======================================================
+=== FAZA 3: Migracija podataka i zamena DataRepository ===
+=======================================================
+Opis: Ovo je glavna faza. Čita postojeće podatke iz z.json, ubacuje ih
+u Room bazu, zatim menja DataRepository da koristi Room umesto JSON fajla.
+Google Drive backup/restore nastavlja da radi preko exportJson/importJson.
+
+Kontekst projekta: Android app (com.zaduzenja.app) za praćenje zaduženja
+radne opreme. Koristi MVVM-lite (TrackingViewModel + DataRepository singleton).
+Room sloj je kreiran u prethodnoj fazi (AppDatabase, ArticleDao, entiteti
+u paketu com.zaduzenja.app.data.db).
+
+Fajlovi koji se menjaju:
+- android/app/src/main/java/com/zaduzenja/app/Data.kt — kompletna zamena DataRepository klase
+- android/app/src/main/java/com/zaduzenja/app/ZaduzenjaApplication.kt — inicijalizacija Room baze + migracija
+- android/app/src/main/java/com/zaduzenja/app/Notifications.kt — ažuriranje Worker-a da koristi Room
+
+Fajlovi koji se kreiraju:
+- android/app/src/main/java/com/zaduzenja/app/data/db/JsonToRoomMigration.kt — jednokratna migracija
+
+Detalji:
+
+1. JsonToRoomMigration.kt — jednokratna migracija JSON → Room:
+   ```kotlin
+   package com.zaduzenja.app.data.db
+
+   import android.content.Context
+   import android.util.Log
+   import org.json.JSONArray
+   import org.json.JSONObject
+   import java.io.File
+
+   private const val TAG = "JsonToRoomMigration"
+   private const val PREFS_NAME = "zaduzenja_migration"
+   private const val KEY_MIGRATED = "json_to_room_done"
+
+   /**
+    * Jednokratna migracija iz z.json u Room bazu.
+    * Čuva flag u SharedPreferences da se ne izvršava ponovo.
+    */
+   suspend fun migrateJsonToRoom(context: Context, dao: ArticleDao) {
+       val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+       if (prefs.getBoolean(KEY_MIGRATED, false)) {
+           return // Već migrirano
+       }
+
+       val file = File(context.filesDir, "z.json")
+       if (!file.exists()) {
+           // Nema JSON fajla — kopiraj iz assets pa migriraj
+           try {
+               context.assets.open("z.json").use { input ->
+                   file.outputStream().use { output ->
+                       input.copyTo(output)
+                   }
+               }
+           } catch (e: Exception) {
+               Log.e(TAG, "Neuspelo kopiranje assets/z.json", e)
+               initializeEmptyRoom(dao)
+               prefs.edit().putBoolean(KEY_MIGRATED, true).apply()
+               return
+           }
+       }
+
+       try {
+           val raw = file.readText(Charsets.UTF_8)
+           val json = JSONObject(raw)
+           val articleTypes = listOf("rukavice", "maxicut", "majica", "cipele", "odelo")
+
+           for (type in articleTypes) {
+               val obj = json.optJSONObject(type)
+               val lastStr = obj?.optString("last_assignment")
+               val lastAssignment = if (lastStr.isNullOrBlank() || lastStr == "null") null else lastStr
+
+               // Ubaci article
+               dao.insertArticle(ArticleEntity(
+                   articleType = type,
+                   lastAssignment = lastAssignment
+               ))
+
+               // Ubaci history entries
+               val historyArray = obj?.optJSONArray("history") ?: JSONArray()
+               val entries = mutableListOf<HistoryEntryEntity>()
+               for (i in 0 until historyArray.length()) {
+                   val item = historyArray.get(i)
+                   if (item is JSONObject) {
+                       val date = item.getString("date")
+                       val size = item.optString("size", "").ifBlank { null }
+                       entries.add(HistoryEntryEntity(
+                           articleType = type,
+                           date = date,
+                           size = size
+                       ))
+                   } else {
+                       // Stari format — niz stringova
+                       val dateStr = item.toString()
+                       if (dateStr.isNotBlank() && dateStr != "null") {
+                           entries.add(HistoryEntryEntity(
+                               articleType = type,
+                               date = dateStr
+                           ))
+                       }
+                   }
+               }
+               if (entries.isNotEmpty()) {
+                   dao.insertHistoryEntries(entries)
+               }
+           }
+
+           prefs.edit().putBoolean(KEY_MIGRATED, true).apply()
+           Log.i(TAG, "Migracija JSON → Room završena uspešno")
+
+       } catch (e: Exception) {
+           Log.e(TAG, "Greška pri migraciji", e)
+           // Ako je puklo, inicijalizuj prazno
+           initializeEmptyRoom(dao)
+           prefs.edit().putBoolean(KEY_MIGRATED, true).apply()
+       }
+   }
+
+   private suspend fun initializeEmptyRoom(dao: ArticleDao) {
+       val types = listOf("rukavice", "maxicut", "majica", "cipele", "odelo")
+       dao.insertArticles(types.map { ArticleEntity(articleType = it, lastAssignment = null) })
+   }
+   ```
+
+2. Data.kt — zamena DataRepository klase:
+   VAŽNO: Pročitaj trenutni Data.kt pre izmena. NE menjaj: ArticleType enum,
+   HistoryEntry data class, ArticleRecord data class, DateUtils object,
+   ArticleStatus, AssignmentResult, AssignmentResponse, TrackingViewModel.
+
+   SAMO zameni klasu DataRepository (linije ~142-267 u trenutnom fajlu).
+
+   Nova DataRepository klasa:
+   ```kotlin
+   class DataRepository(private val context: Context, private val dao: ArticleDao) {
+       private var onChangeCallback: (() -> Unit)? = null
+
+       fun onChange(callback: () -> Unit) {
+           onChangeCallback = callback
+       }
+
+       // --- Sinhroni metodi (za TrackingViewModel kompatibilnost) ---
+       // TrackingViewModel poziva getRecord/getAllRecords/updateRecord sinhrono,
+       // pa koristimo runBlocking za bridge. Ovo nije idealno ali čuva
+       // potpunu kompatibilnost sa postojećim kodom.
+
+       fun getRecord(articleType: ArticleType): ArticleRecord {
+           return kotlinx.coroutines.runBlocking {
+               val entity = dao.getArticle(articleType.key)
+               val historyEntities = dao.getHistory(articleType.key)
+               toArticleRecord(entity, historyEntities)
+           }
+       }
+
+       fun getAllRecords(): Map<ArticleType, ArticleRecord> {
+           return kotlinx.coroutines.runBlocking {
+               val result = mutableMapOf<ArticleType, ArticleRecord>()
+               for (type in ArticleType.values()) {
+                   val entity = dao.getArticle(type.key)
+                   val historyEntities = dao.getHistory(type.key)
+                   result[type] = toArticleRecord(entity, historyEntities)
+               }
+               result
+           }
+       }
+
+       fun updateRecord(articleType: ArticleType, record: ArticleRecord) {
+           kotlinx.coroutines.runBlocking {
+               val lastStr = record.lastAssignment?.format(DateUtils.isoFormatter)
+               dao.updateLastAssignment(articleType.key, lastStr)
+
+               // Obriši stare history entries za ovaj tip i ubaci nove
+               // (jednostavniji pristup koji garantuje konzistentnost)
+               val oldEntries = dao.getHistory(articleType.key)
+               for (old in oldEntries) {
+                   dao.deleteHistoryEntry(old.id)
+               }
+
+               val newEntries = record.history.map { entry ->
+                   HistoryEntryEntity(
+                       articleType = articleType.key,
+                       date = entry.date.format(DateUtils.isoFormatter),
+                       size = entry.size
+                   )
+               }
+               if (newEntries.isNotEmpty()) {
+                   dao.insertHistoryEntries(newEntries)
+               }
+           }
+           onChangeCallback?.invoke()
+       }
+
+       // save() i saveIfDirty() više nisu potrebni jer Room automatski čuva,
+       // ali zadržavamo ih kao prazne metode za kompatibilnost sa pozivima
+       // u TrackingViewModel i drugde
+       fun save() { /* Room auto-persist */ }
+       fun saveIfDirty() { /* Room auto-persist */ }
+
+       // --- JSON export/import za Google Drive backup ---
+
+       fun exportJson(pretty: Boolean = true): String {
+           return kotlinx.coroutines.runBlocking {
+               val root = JSONObject()
+               for (type in ArticleType.values()) {
+                   val entity = dao.getArticle(type.key)
+                   val historyEntities = dao.getHistory(type.key)
+                   val record = toArticleRecord(entity, historyEntities)
+                   root.put(type.key, record.toJson())
+               }
+               if (pretty) root.toString(2) else root.toString()
+           }
+       }
+
+       fun importJson(raw: String) {
+           kotlinx.coroutines.runBlocking {
+               val json = JSONObject(raw)
+               for (type in ArticleType.values()) {
+                   val obj = json.optJSONObject(type.key)
+                   val record = if (obj != null) {
+                       ArticleRecord.fromJson(obj)
+                   } else {
+                       ArticleRecord()
+                   }
+
+                   // Ažuriraj article
+                   val lastStr = record.lastAssignment?.format(DateUtils.isoFormatter)
+                   dao.insertArticle(ArticleEntity(
+                       articleType = type.key,
+                       lastAssignment = lastStr
+                   ))
+
+                   // Zameni history
+                   val oldEntries = dao.getHistory(type.key)
+                   for (old in oldEntries) {
+                       dao.deleteHistoryEntry(old.id)
+                   }
+
+                   val newEntries = record.history.map { entry ->
+                       HistoryEntryEntity(
+                           articleType = type.key,
+                           date = entry.date.format(DateUtils.isoFormatter),
+                           size = entry.size
+                       )
+                   }
+                   if (newEntries.isNotEmpty()) {
+                       dao.insertHistoryEntries(newEntries)
+                   }
+               }
+           }
+           onChangeCallback?.invoke()
+       }
+
+       // --- Pomoćna funkcija ---
+
+       private fun toArticleRecord(
+           entity: ArticleEntity?,
+           historyEntities: List<HistoryEntryEntity>
+       ): ArticleRecord {
+           val lastAssignment = entity?.lastAssignment?.let { DateUtils.parseDate(it) }
+           val history = historyEntities.map { e ->
+               HistoryEntry(
+                   date = DateUtils.parseDate(e.date) ?: java.time.LocalDate.now(),
+                   size = e.size
+               )
+           }
+           return ArticleRecord(lastAssignment = lastAssignment, history = history)
+       }
+   }
+   ```
+
+   DODAJ import na vrh Data.kt:
+   ```kotlin
+   import com.zaduzenja.app.data.db.ArticleEntity
+   import com.zaduzenja.app.data.db.HistoryEntryEntity
+   import org.json.JSONObject
+   ```
+
+   NAPOMENA: JSONObject import već postoji u Data.kt. ArticleEntity i
+   HistoryEntryEntity su novi importi. Importi za File klasu se mogu ukloniti
+   jer DataRepository više ne koristi fajl direktno.
+
+3. ZaduzenjaApplication.kt — inicijalizacija Room baze + migracija:
+   ```kotlin
+   package com.zaduzenja.app
+
+   import android.app.Application
+   import android.util.Log
+   import com.zaduzenja.app.data.backup.GoogleDriveBackup
+   import com.zaduzenja.app.data.backup.GoogleDriveBackupProvider
+   import com.zaduzenja.app.data.db.AppDatabase
+   import com.zaduzenja.app.data.db.migrateJsonToRoom
+   import kotlinx.coroutines.CoroutineScope
+   import kotlinx.coroutines.Dispatchers
+   import kotlinx.coroutines.SupervisorJob
+   import kotlinx.coroutines.launch
+
+   private const val TAG = "ZaduzenjaApplication"
+
+   class ZaduzenjaApplication : Application() {
+       lateinit var dataRepository: DataRepository
+           private set
+       lateinit var googleDriveBackup: GoogleDriveBackup
+           private set
+       lateinit var database: AppDatabase
+           private set
+
+       private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+       override fun onCreate() {
+           super.onCreate()
+
+           // Inicijalizuj Room bazu
+           database = AppDatabase.getInstance(this)
+           val dao = database.articleDao()
+
+           // Pokreni migraciju iz JSON-a u pozadini
+           applicationScope.launch {
+               migrateJsonToRoom(this@ZaduzenjaApplication, dao)
+           }
+
+           // Kreiraj DataRepository sa Room DAO
+           dataRepository = DataRepository(this, dao)
+
+           googleDriveBackup = GoogleDriveBackupProvider.get(this)
+
+           // Auto-backup pri promeni
+           dataRepository.onChange {
+               if (googleDriveBackup.isSignedIn()) {
+                   applicationScope.launch {
+                       googleDriveBackup.backup(dataRepository.exportJson())
+                   }
+               }
+           }
+
+           // Auto-restore pri pokretanju
+           applicationScope.launch {
+               try {
+                   if (googleDriveBackup.isSignedIn()) {
+                       val data = googleDriveBackup.restore()
+                       if (data != null && data.isNotBlank()) {
+                           dataRepository.importJson(data)
+                       }
+                   }
+               } catch (e: Exception) {
+                   Log.e(TAG, "Failed to restore from Google Drive", e)
+               }
+           }
+       }
+   }
+   ```
+
+4. Notifications.kt — ažuriranje AvailabilityNotificationWorker:
+   Zameni samo metod doWork() u klasi AvailabilityNotificationWorker.
+   Trenutno kreira novi DataRepository(context), treba da koristi Room DAO.
+
+   Zameni:
+   ```kotlin
+   val repository = DataRepository(context)
+   ```
+   Sa:
+   ```kotlin
+   val database = AppDatabase.getInstance(context)
+   val dao = database.articleDao()
+   val repository = DataRepository(context, dao)
+   ```
+
+   Dodaj import na vrh Notifications.kt:
+   ```kotlin
+   import com.zaduzenja.app.data.db.AppDatabase
+   ```
+
+Rezultat faze: Aplikacija koristi Room bazu. Postojeći podaci iz z.json
+su migrirani u bazu pri prvom pokretanju nakon ažuriranja. Google Drive
+backup/restore radi kao i pre. Notifikacije rade kao i pre.
+
+=======================================================
+Redosled izvršavanja:
+=======================================================
+FAZA 1 → FAZA 2 → FAZA 3
+
+Faza 1 je preduslov za fazu 2 (Room zavisnosti moraju biti dostupne).
+Faza 2 je preduslov za fazu 3 (entiteti i DAO moraju postojati).
+Faze se izvršavaju striktno po redu.
+
+NAPOMENA O OČUVANJU PODATAKA:
+- Migracija čita postojeći z.json fajl i kopira SVE podatke u Room bazu
+- z.json fajl se NE briše (ostaje kao backup)
+- Migracija se izvršava samo jednom (flag u SharedPreferences)
+- Ako migracija ne uspe, inicijalizuju se prazni podaci (failsafe)
+- Google Drive restore nakon migracije će prepisati Room podatke
+  (isto ponašanje kao i ranije sa JSON fajlom)
